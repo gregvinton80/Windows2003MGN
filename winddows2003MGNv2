@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Variables
-INSTANCE_ID_2003="i-08babeb92e8918c76"
-INSTANCE_ID_HELPER="i-02ece231b83d66f76"
+INSTANCE_ID_2003="Instance ID for Windows 2003 instance"
+INSTANCE_ID_HELPER="Instance ID for Windows helper instance"
 DRIVE_LETTER="D"
-SECRET_NAME="mySecretPassword"
+SECRET_NAME="AWS Secrets Manager Secret Name"
 AWS_PAGER=""
 
 # Retrieve the password from AWS Secrets Manager
