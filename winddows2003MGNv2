@@ -1,0 +1,84 @@
+#!/bin/bash
+
+# Variables
+INSTANCE_ID_2003="i-08babeb92e8918c76"
+INSTANCE_ID_HELPER="i-02ece231b83d66f76"
+DRIVE_LETTER="D"
+SECRET_NAME="mySecretPassword"
+AWS_PAGER=""
+
+# Retrieve the password from AWS Secrets Manager
+DEFAULT_PASSWORD=$(aws secretsmanager get-secret-value --secret-id $SECRET_NAME --query SecretString --output text | jq -r '.DefaultPassword')
+
+# Stop the Windows 2003/2008 instance
+aws ec2 stop-instances --instance-ids $INSTANCE_ID_2003
+aws ec2 wait instance-stopped --instance-ids $INSTANCE_ID_2003
+
+# Get the volume ID of the /dev/sda1 device
+VOLUME_ID=$(aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=$INSTANCE_ID_2003 Name=attachment.device,Values=/dev/sda1 --query "Volumes[0].VolumeId" --output text)
+
+# Detach boot volume from original instance
+aws ec2 detach-volume --volume-id $VOLUME_ID
+aws ec2 wait volume-available --volume-ids $VOLUME_ID
+
+# Attach boot volume to helper instance
+aws ec2 attach-volume --volume-id $VOLUME_ID --instance-id $INSTANCE_ID_HELPER --device /dev/xvdf
+aws ec2 wait volume-in-use --volume-ids $VOLUME_ID
+
+# Ensure the helper instance is in the running state
+aws ec2 start-instances --instance-ids $INSTANCE_ID_HELPER
+aws ec2 wait instance-running --instance-ids $INSTANCE_ID_HELPER
+
+# Bring the offline disk online
+COMMAND_ID_DRIVE=$(aws ssm send-command --instance-ids $INSTANCE_ID_HELPER --document-name "AWS-RunPowerShellScript" --parameters "{\"commands\":[
+  \"\$disk = Get-Disk | Where-Object { \$_.OperationalStatus -eq 'Offline' }\",
+  \"if (\$disk) { Set-Disk -Number \$disk.Number -IsOffline \$false } else { Write-Output 'No offline disks found, assuming disk is online and assigned to drive $DRIVE_LETTER' }\"
+]}" --query "Command.CommandId" --output text)
+aws ssm wait command-executed --instance-id $INSTANCE_ID_HELPER --command-id $COMMAND_ID_DRIVE
+
+# Make the disk writable
+COMMAND_ID_WRITABLE=$(aws ssm send-command --instance-ids $INSTANCE_ID_HELPER --document-name "AWS-RunPowerShellScript" --parameters "{\"commands\":[
+  \"Get-Disk | Where-Object { \$_.OperationalStatus -eq 'Online' -and \$_.Number -eq (Get-Partition -DriveLetter $DRIVE_LETTER).DiskNumber } | Set-Disk -IsReadOnly \$false\"
+]}" --query "Command.CommandId" --output text)
+aws ssm wait command-executed --instance-id $INSTANCE_ID_HELPER --command-id $COMMAND_ID_WRITABLE
+
+# Copy Citrix files
+COMMAND_ID_COPY=$(aws ssm send-command --instance-ids $INSTANCE_ID_HELPER --document-name "AWS-RunPowerShellScript" --parameters "{\"commands\":[
+  \"if (-not (Test-Path -Path '$DRIVE_LETTER:\\\\citrix')) { New-Item -Path '$DRIVE_LETTER:\\\\citrix' -ItemType Directory -Force }\",
+  \"Copy-Item -Path 'C:\\\\citrix\\\\*' -Destination '$DRIVE_LETTER:\\\\citrix' -Recurse -Force\"
+]}" --query "Command.CommandId" --output text)
+aws ssm wait command-executed --instance-id $INSTANCE_ID_HELPER --command-id $COMMAND_ID_COPY
+
+# Update registry
+COMMAND_ID_REG=$(aws ssm send-command --instance-ids $INSTANCE_ID_HELPER --document-name "AWS-RunPowerShellScript" --parameters "{\"commands\":[
+  \"reg load HKLM\\\\00Software $DRIVE_LETTER:\\\\Windows\\\\System32\\\\Config\\\\Software\",
+  \"Set-ItemProperty -Path 'HKLM:\\\\00Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunOnce' -Name 'RHPurge' -Value 'C:\\\\Windows\\\\System32\\\\WindowsPowershell\\\\v1.0\\\\powershell.exe -File $DRIVE_LETTER:\\\\citrix\\\\Citrix-Win_PV\\\\Purge.ps1'\",
+  \"Set-ItemProperty -Path 'HKLM:\\\\00Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunOnce' -Name 'CitrixInstall' -Value 'C:\\\\citrix\\\\Citrix-Win_PV\\\\Citrix_xensetup.exe /S'\",
+  \"Set-ItemProperty -Path 'HKLM:\\\\00Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\RunOnce' -Name 'RemoveRegistryValues' -Value 'C:\\\\citrix\\\\Citrix-Win_PV\\\\RunRemoveAutoLogin.bat'\",
+  \"Set-ItemProperty -Path 'HKLM:\\\\00Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Winlogon' -Name 'AutoAdminLogon' -Value '1'\",
+  \"Set-ItemProperty -Path 'HKLM:\\\\00Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Winlogon' -Name 'DefaultUsername' -Value 'Administrator'\",
+  \"Set-ItemProperty -Path 'HKLM:\\\\00Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\Winlogon' -Name 'DefaultPassword' -Value '$DEFAULT_PASSWORD'\",
+  \"if (-not (Test-Path 'HKLM:\\\\00Software\\\\Policies\\\\Microsoft\\\\Windows NT\\\\Reliability')) { New-Item -Path 'HKLM:\\\\00Software\\\\Policies\\\\Microsoft\\\\Windows NT\\\\Reliability' -ItemType Directory }\",
+  \"Set-ItemProperty -Path 'HKLM:\\\\00Software\\\\Policies\\\\Microsoft\\\\Windows NT\\\\Reliability' -Name 'ShutDownReasonOn' -Value '0'\",
+  \"reg unload HKLM\\\\00Software\"
+]}" --query "Command.CommandId" --output text)
+aws ssm wait command-executed --instance-id $INSTANCE_ID_HELPER --command-id $COMMAND_ID_REG
+
+# Ensure the registry hive is unloaded
+COMMAND_ID_UNLOAD=$(aws ssm send-command --instance-ids $INSTANCE_ID_HELPER --document-name "AWS-RunPowerShellScript" --parameters "{\"commands\":[
+  \"if (Test-Path 'HKLM:\\\\00Software') { reg unload HKLM\\\\00Software }\"
+]}" --query "Command.CommandId" --output text)
+aws ssm wait command-executed --instance-id $INSTANCE_ID_HELPER --command-id $COMMAND_ID_UNLOAD
+
+# Force detach the specific volume from helper instance
+aws ec2 detach-volume --volume-id $VOLUME_ID --instance-id $INSTANCE_ID_HELPER --force
+aws ec2 wait volume-available --volume-ids $VOLUME_ID
+
+# Reattach volume to original instance
+aws ec2 attach-volume --volume-id $VOLUME_ID --instance-id $INSTANCE_ID_2003 --device /dev/sda1
+
+# Start the Windows 2003/2008 instance
+aws ec2 start-instances --instance-ids $INSTANCE_ID_2003
+aws ec2 wait instance-status-ok --instance-ids $INSTANCE_ID_2003
+
+echo "Migration process complete. Verify the instance status and perform necessary checks."
